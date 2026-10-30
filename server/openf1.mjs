@@ -18,6 +18,7 @@ const PARAMS = new Set([
 const SETTLE_MS = 6 * 60 * 60 * 1000; // results can still be amended (penalties) for a few hours after a session
 const TTL_MS = { short: 60 * 1000, default: 60 * 60 * 1000 };
 const PACE_MS = 375;
+const FIRST_SEASON = 2023; // OpenF1's archive starts here
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -91,6 +92,8 @@ export function createOpenF1Proxy(db) {
       const end = s ? new Date(s.date_end || s.date_start).getTime() : null;
       if (end != null && end + SETTLE_MS < now) return null;
     }
+    const year = Number(params.get('year'));
+    if (year && year < new Date().getUTCFullYear()) return null; // past seasons' schedules are final
     return now + TTL_MS.default; // schedules, standings lists, etc.
   }
 
@@ -121,12 +124,17 @@ export function createOpenF1Proxy(db) {
     }
   }
 
-  // Pre-warm: fetch each finished Grand Prix weekend once, so it is stored before anyone asks for it.
+  // Pre-warm: fetch each finished Grand Prix weekend once (this season, plus a one-time catch-up of
+  // past seasons back to 2023), so it is stored before anyone asks for it.
   // Between races this is a single sleeping timer set for just after the next race settles, capped at a
   // day so schedule changes are picked up. With no visitors that is about one OpenF1 request per day.
   db.exec(`CREATE TABLE IF NOT EXISTS openf1_warmed (meeting_key INTEGER PRIMARY KEY, warmed_at INTEGER NOT NULL)`);
   const isWarmed = db.prepare('SELECT 1 FROM openf1_warmed WHERE meeting_key = ?');
   const markWarmed = db.prepare('INSERT OR REPLACE INTO openf1_warmed (meeting_key, warmed_at) VALUES (?, ?)');
+  // Past seasons are caught up once; after that they are never checked again.
+  db.exec(`CREATE TABLE IF NOT EXISTS openf1_warmed_seasons (year INTEGER PRIMARY KEY, warmed_at INTEGER NOT NULL)`);
+  const isSeasonDone = db.prepare('SELECT 1 FROM openf1_warmed_seasons WHERE year = ?');
+  const markSeasonDone = db.prepare('INSERT OR REPLACE INTO openf1_warmed_seasons (year, warmed_at) VALUES (?, ?)');
   let timer;
 
   // Results, laps, standings and the like for every session of the weekend; heavy telemetry stays on demand.
@@ -146,19 +154,29 @@ export function createOpenF1Proxy(db) {
     clearTimeout(timer);
     let next = Date.now() + DAY_MS;
     try {
-      const year = new Date().getUTCFullYear();
-      await load('meetings', `year=${year}`);
-      const races = (await load('sessions', `year=${year}`)).filter(s => s.session_name === 'Race');
-      for (const race of races) {
-        const due = new Date(race.date_end || race.date_start).getTime() + SETTLE_MS;
-        if (due > Date.now()) {
-          next = Math.min(next, due + 60_000);
-          continue;
+      const current = new Date().getUTCFullYear();
+      const years = [current];
+      for (let y = current - 1; y >= FIRST_SEASON; y--) if (!isSeasonDone.get(y)) years.push(y);
+      for (const year of years) {
+        await load('meetings', `year=${year}`);
+        const races = (await load('sessions', `year=${year}`)).filter(s => s.session_name === 'Race');
+        let seasonDone = true;
+        for (const race of races) {
+          const due = new Date(race.date_end || race.date_start).getTime() + SETTLE_MS;
+          if (due > Date.now()) {
+            seasonDone = false;
+            next = Math.min(next, due + 60_000);
+            continue;
+          }
+          if (isWarmed.get(race.meeting_key)) continue;
+          await warmMeeting(race.meeting_key);
+          markWarmed.run(race.meeting_key, Date.now());
+          console.log(`OpenF1 pre-warm: stored ${year} meeting ${race.meeting_key}`);
         }
-        if (isWarmed.get(race.meeting_key)) continue;
-        await warmMeeting(race.meeting_key);
-        markWarmed.run(race.meeting_key, Date.now());
-        console.log(`OpenF1 pre-warm: stored meeting ${race.meeting_key}`);
+        if (year < current && seasonDone) {
+          markSeasonDone.run(year, Date.now());
+          console.log(`OpenF1 pre-warm: ${year} season complete`);
+        }
       }
     } catch (error) {
       // Usually OpenF1's live-session lock; a weekend is only marked done once every fetch succeeded.
