@@ -268,8 +268,8 @@ export default function App() {
 
           {err && (
             <Alert variant="destructive">
-              <AlertTitle>OpenF1 unavailable</AlertTitle>
-              <AlertDescription>{String((err as Error).message)}. Check your connection and try again.</AlertDescription>
+              <AlertTitle>Race data unavailable</AlertTitle>
+              <AlertDescription>{String((err as Error).message)}</AlertDescription>
             </Alert>
           )}
           {loading && (
