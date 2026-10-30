@@ -18,6 +18,8 @@ const PARAMS = new Set([
 const SETTLE_MS = 6 * 60 * 60 * 1000; // results can still be amended (penalties) for a few hours after a session
 const TTL_MS = { short: 60 * 1000, default: 60 * 60 * 1000 };
 const PACE_MS = 375;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 export function createOpenF1Proxy(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS openf1_cache (
@@ -119,7 +121,62 @@ export function createOpenF1Proxy(db) {
     }
   }
 
-  return async function handler(req, res) {
+  // Pre-warm: fetch each finished Grand Prix weekend once, so it is stored before anyone asks for it.
+  // Between races this is a single sleeping timer set for just after the next race settles, capped at a
+  // day so schedule changes are picked up. With no visitors that is about one OpenF1 request per day.
+  db.exec(`CREATE TABLE IF NOT EXISTS openf1_warmed (meeting_key INTEGER PRIMARY KEY, warmed_at INTEGER NOT NULL)`);
+  const isWarmed = db.prepare('SELECT 1 FROM openf1_warmed WHERE meeting_key = ?');
+  const markWarmed = db.prepare('INSERT OR REPLACE INTO openf1_warmed (meeting_key, warmed_at) VALUES (?, ?)');
+  let timer;
+
+  // Results, laps, standings and the like for every session of the weekend; heavy telemetry stays on demand.
+  async function warmMeeting(meetingKey) {
+    const sessions = await load('sessions', `meeting_key=${meetingKey}`);
+    const jobs = [];
+    for (const s of sessions) {
+      const q = `session_key=${s.session_key}`;
+      jobs.push(['sessions', q], ['drivers', q], ['session_result', q], ['laps', q], ['weather', q]);
+      if (s.session_type === 'Race') jobs.push(['position', q], ['race_control', q], ['pit', q], ['stints', q], ['championship_drivers', q], ['championship_teams', q]);
+      if (s.session_name === 'Qualifying') jobs.push(['starting_grid', q]);
+    }
+    for (const [endpoint, query] of jobs) await get(endpoint, query); // sequential, so visitors never queue behind a burst
+  }
+
+  async function prewarm() {
+    clearTimeout(timer);
+    let next = Date.now() + DAY_MS;
+    try {
+      const year = new Date().getUTCFullYear();
+      await load('meetings', `year=${year}`);
+      const races = (await load('sessions', `year=${year}`)).filter(s => s.session_name === 'Race');
+      for (const race of races) {
+        const due = new Date(race.date_end || race.date_start).getTime() + SETTLE_MS;
+        if (due > Date.now()) {
+          next = Math.min(next, due + 60_000);
+          continue;
+        }
+        if (isWarmed.get(race.meeting_key)) continue;
+        await warmMeeting(race.meeting_key);
+        markWarmed.run(race.meeting_key, Date.now());
+        console.log(`OpenF1 pre-warm: stored meeting ${race.meeting_key}`);
+      }
+    } catch (error) {
+      // Usually OpenF1's live-session lock; a weekend is only marked done once every fetch succeeded.
+      next = Math.min(next, Date.now() + HOUR_MS);
+      console.log('OpenF1 pre-warm paused:', error instanceof Error ? error.message : String(error));
+    }
+    timer = setTimeout(prewarm, Math.max(60_000, next - Date.now()));
+    timer.unref();
+  }
+
+  function startPrewarm(delayMs = 30_000) {
+    timer = setTimeout(prewarm, delayMs);
+    timer.unref();
+  }
+
+  return { handler, startPrewarm };
+
+  async function handler(req, res) {
     const endpoint = req.params.endpoint;
     if (!ENDPOINTS.has(endpoint)) return res.status(404).json({ error: 'unknown_endpoint' });
     const raw = req.originalUrl.split('?')[1] ?? '';
@@ -152,7 +209,7 @@ export function createOpenF1Proxy(db) {
             : 'OpenF1 could not be reached. Please try again shortly.',
       });
     }
-  };
+  }
 }
 
 class UpstreamError extends Error {

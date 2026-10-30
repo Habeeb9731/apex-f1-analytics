@@ -116,7 +116,9 @@ function burstLimited(req, res, next) {
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
-app.get('/api/f1/:endpoint', createOpenF1Proxy(db));
+const openf1 = createOpenF1Proxy(db);
+app.get('/api/f1/:endpoint', openf1.handler);
+if (isProduction || process.env.OPENF1_PREWARM === '1') openf1.startPrewarm();
 app.get('/api/auth/status', async (req, res) => {
   const user = await currentUser(req);
   const configured = Boolean(clientId && clientSecret && sessionSecret.length >= 32 && (!isProduction || (process.env.APP_ORIGIN?.startsWith('https://') && allowedIds.size > 0)));
